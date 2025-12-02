@@ -4,15 +4,40 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Hush</title>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body>
   <div id="root"></div>
 
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+
   <script type="text/babel">
+    // Define the sound globally for easy access
+    const RECEIVE_SOUND_DATA_URL = 'data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYHGGS57OihUBELTqXh8LJeGgU7kdXw0YU2Bx1osOvhoU8PC0qh4PC0YhwGPpHV8NKHOQUE';
+
+    // ⚠️ REPLACE WITH YOUR ACTUAL FIREBASE CONFIG ⚠️
+    const firebaseConfig = {
+      apiKey: "AIzaSyDhpiBs71WG_YPr0Ztl_ZBKjYG2hzBcJUc",
+      authDomain: "hush-app-14725.firebaseapp.com",
+      databaseURL: "https://hush-app-14725-default-rtdb.firebaseio.com",
+      projectId: "hush-app-14725",
+      storageBucket: "hush-app-14725.firebasestorage.app",
+      messagingSenderId: "915121601862",
+      appId: "1:915121601862:web:f6992c7d83e8359ef63947"
+    };
+
+    // Initialize Firebase only once
+    if (!firebase.apps.length) {
+      firebase.initializeApp(firebaseConfig);
+    }
+    const db = firebase.database();
+    
     const { useState, useEffect, useRef } = React;
 
     function HushApp() {
@@ -23,6 +48,10 @@
       const [error, setError] = useState('');
       const [onlineUsers, setOnlineUsers] = useState({});
       const messagesEndRef = useRef(null);
+      const prevMessagesRef = useRef([]); 
+      const transientTimeoutsRef = useRef({}); 
+      
+      const isMaster = currentUser === 'regae';
 
       // Display names mapping
       const getDisplayName = (user) => {
@@ -36,50 +65,187 @@
           setCurrentUser(stored.toLowerCase());
         }
       }, []);
+      
+      // Helper function to play sound safely
+      const playReceiveSound = () => {
+        const sound = new Audio(RECEIVE_SOUND_DATA_URL);
+        sound.volume = 0.3;
+        sound.play().catch(error => {
+          console.warn("Audio playback blocked by browser:", error.message);
+        });
+      };
 
-      // Online status management
+
+      // ------------------------------------------------------------------
+      // FIREBASE IMPLEMENTATION: ONLINE STATUS MANAGEMENT
+      // ------------------------------------------------------------------
       useEffect(() => {
         if (!currentUser) return;
 
-        const markOnline = () => {
-          const status = {
-            user: currentUser,
-            timestamp: Date.now()
-          };
-          sessionStorage.setItem('hushvenus_status_' + currentUser, JSON.stringify(status));
-        };
+        const userStatusRef = db.ref(`users/${currentUser}/online`);
+        const otherUser = currentUser === 'regae' ? 'phish' : 'regae';
+        const otherUserStatusRef = db.ref(`users/${otherUser}/online`);
 
-        markOnline();
-        const interval = setInterval(markOnline, 2000);
+        userStatusRef.onDisconnect().set(false);
+        userStatusRef.set(true);
 
-        const checkStatus = () => {
-          const otherUser = currentUser === 'regae' ? 'phish' : 'regae';
-          const statusStr = sessionStorage.getItem('hushvenus_status_' + otherUser);
-          
-          const newOnlineUsers = {};
-          if (statusStr) {
-            const status = JSON.parse(statusStr);
-            if (Date.now() - status.timestamp < 5000) {
-              newOnlineUsers[otherUser] = true;
-            }
-          }
-          setOnlineUsers(newOnlineUsers);
-        };
-
-        checkStatus();
-        const statusInterval = setInterval(checkStatus, 2000);
+        otherUserStatusRef.on('value', (snapshot) => {
+          const isOnline = snapshot.val() === true;
+          setOnlineUsers({ [otherUser]: isOnline });
+        });
 
         return () => {
-          clearInterval(interval);
-          clearInterval(statusInterval);
-          sessionStorage.removeItem('hushvenus_status_' + currentUser);
+          otherUserStatusRef.off('value');
+          userStatusRef.onDisconnect().cancel(); 
         };
       }, [currentUser]);
+      
+      
+      // ------------------------------------------------------------------
+      // 🔥 REFACTORED: ROLE-BASED MESSAGE LISTENERS & SELF-DESTRUCT LOGIC
+      // ------------------------------------------------------------------
+      useEffect(() => {
+        if (!currentUser) return;
+        const messagesRef = db.ref('messages');
+        
+        const listener = messagesRef.on('value', (snapshot) => {
+          const data = snapshot.val();
+          const allMsgs = [];
+          if (data) {
+            Object.keys(data).forEach(key => {
+              allMsgs.push({ ...data[key], firebaseId: key });
+            });
+          }
+          allMsgs.sort((a, b) => a.timestamp - b.timestamp);
+          
+          let loadedMessages = [];
+          let newMessagesToProcess = [];
+
+          if (isMaster) {
+            // Reggae (Master): sees all messages, persists indefinitely (since they stay in DB).
+            loadedMessages = allMsgs;
+            newMessagesToProcess = loadedMessages.filter(
+                m => !prevMessagesRef.current.some(p => p.firebaseId === m.firebaseId)
+            );
+          } else { 
+            // Phish (Transient): All messages (hers or Reggae's) self-destruct after 5s.
+            
+            const currentDbIds = new Set(allMsgs.map(m => m.firebaseId));
+            const existingLocalIds = new Set(prevMessagesRef.current.map(m => m.firebaseId));
+            
+            // 1. Find messages that are in the DB now but not yet in Phish's local state.
+            const newlyAppearedDbMsgs = allMsgs.filter(m => !existingLocalIds.has(m.firebaseId));
+
+            // 2. Start with existing local messages that still exist in DB (i.e., not deleted by Reggae)
+            loadedMessages = prevMessagesRef.current.filter(m => currentDbIds.has(m.firebaseId));
+
+            // 3. Add newly appeared messages
+            newlyAppearedDbMsgs.forEach(newMsg => {
+                loadedMessages.push(newMsg);
+                newMessagesToProcess.push(newMsg); 
+            });
+            loadedMessages.sort((a, b) => a.timestamp - b.timestamp);
+          }
+
+          // Sound Play Logic (Only when a new message appears)
+          if (newMessagesToProcess.length > 0 && currentUser) {
+            const latestNewMsg = newMessagesToProcess[newMessagesToProcess.length - 1];
+            if (latestNewMsg.sender !== currentUser) {
+              playReceiveSound(); 
+            }
+          }
+          
+          setMessages(loadedMessages);
+          prevMessagesRef.current = loadedMessages; 
+          
+          // --- Self-Destruct Logic (Phish only) ---
+          if (!isMaster) {
+              newMessagesToProcess.forEach(msg => {
+                // Clear existing timeout if it somehow arrived again (e.g., initial load)
+                if (transientTimeoutsRef.current[msg.firebaseId]) {
+                    clearTimeout(transientTimeoutsRef.current[msg.firebaseId]);
+                }
+                
+                // Set the 5-second timeout to remove the message from Phish's local state
+                const timeoutId = setTimeout(() => {
+                    setMessages(prev => prev.filter(m => m.firebaseId !== msg.firebaseId));
+                    delete transientTimeoutsRef.current[msg.firebaseId];
+                }, 5000); 
+                
+                transientTimeoutsRef.current[msg.firebaseId] = timeoutId;
+              });
+          }
+        });
+
+        return () => {
+          messagesRef.off('value', listener);
+          // Clean up all timeouts on logout/unmount
+          Object.values(transientTimeoutsRef.current).forEach(clearTimeout);
+          transientTimeoutsRef.current = {};
+        };
+      }, [currentUser, isMaster]);
+
+
+      // 🔒 SECURITY IMPLEMENTATION: NO SCREENSHOT (PHISH ONLY) 🔒
+      useEffect(() => {
+        if (isMaster || !currentUser) return; 
+
+        const chatContent = document.getElementById('chat-content');
+        if (!chatContent) return;
+
+        chatContent.style.setProperty('-webkit-user-select', 'none');
+        chatContent.style.setProperty('user-select', 'none');
+
+        const handleCopy = (e) => {
+          e.preventDefault();
+        };
+
+        const applyMask = () => { chatContent.classList.add('secure-mask'); };
+        const removeMask = () => { chatContent.classList.remove('secure-mask'); };
+        
+        const handleVisibilityChange = () => {
+          if (document.hidden) {
+            applyMask();
+          } else {
+            removeMask();
+          }
+        };
+        
+        const handleKeyDown = (e) => {
+            if (e.key === 'PrintScreen' || (e.metaKey && e.shiftKey && (e.key === '3' || e.key === '4'))) {
+                applyMask();
+                setTimeout(removeMask, 500);
+            }
+        };
+
+        document.addEventListener('copy', handleCopy);
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        document.addEventListener('keydown', handleKeyDown);
+
+        return () => {
+          document.removeEventListener('copy', handleCopy);
+          document.removeEventListener('visibilitychange', handleVisibilityChange);
+          document.removeEventListener('keydown', handleKeyDown);
+          chatContent.style.removeProperty('-webkit-user-select');
+          chatContent.classList.remove('secure-mask');
+        };
+      }, [currentUser, isMaster]);
+
 
       // Auto-scroll to bottom
       useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
       }, [messages]);
+
+      // 🗑️ Master Deletion Function (Mutual)
+      const deleteMessageMutual = (firebaseId) => {
+        if (!isMaster) return;
+        
+        // This deletes the message from Firebase, instantly deleting it for both users
+        db.ref(`messages/${firebaseId}`).remove()
+          .catch(error => console.error("Error deleting message: ", error));
+      };
+
 
       // Handle login
       const handleLogin = () => {
@@ -100,28 +266,21 @@
         }
       };
 
-      // Send message
+      // 🛑 REMOVED AUTO-DELETION: All messages now persist in DB for Reggae.
       const sendMessage = () => {
-        if (!inputMessage.trim()) return;
-
-        // Play send sound
-        const sendSound = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYHGGS57OihUBELTqXh8LJeGgU7kdXw0YU2Bx1osOvhoU8PC0qh4PC0YhwGPpHV8NKHOQUE');
-        sendSound.volume = 0.3;
-        sendSound.play().catch(e => console.log('Sound play failed:', e));
+        if (!inputMessage.trim() || !currentUser) return;
 
         const newMessage = {
-          id: Date.now(),
           text: inputMessage,
           sender: currentUser,
           timestamp: Date.now()
         };
+        
+        const messageRef = db.ref('messages').push();
+        messageRef.set(newMessage);
 
-        setMessages(prev => [...prev, newMessage]);
         setInputMessage('');
-
-        setTimeout(() => {
-          setMessages(prev => prev.filter(msg => msg.id !== newMessage.id));
-        }, 3000);
+        // Self-destruction is handled in Phish's useEffect listener (if not master).
       };
 
       const handleMessageKeyPress = (e) => {
@@ -131,7 +290,7 @@
         }
       };
 
-      // Ping other user
+      // Ping other user (remains the same)
       const pingUser = () => {
         const otherUser = currentUser === 'regae' ? 'phish' : 'regae';
         const otherDisplayName = getDisplayName(otherUser);
@@ -139,7 +298,6 @@
           ? 'sophiapecina24@yahoo.com' 
           : 'rhlaroya@gmail.com';
 
-        // Open email client with pre-filled message
         const subject = 'talk?';
         const body = 'talk?';
         const mailtoLink = `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
@@ -159,14 +317,17 @@
         }, 3000);
       };
 
-      // Logout
+      // Logout (remains the same)
       const logout = () => {
+        db.ref(`users/${currentUser}/online`).set(false);
+        db.ref(`users/${currentUser}/online`).onDisconnect().cancel();
+        
         sessionStorage.removeItem('hushvenus_user');
         setCurrentUser(null);
         setMessages([]);
       };
 
-      // Login page
+      // Login page (remains the same)
       if (!currentUser) {
         return (
           <div className="min-h-screen bg-gradient-to-br from-purple-900 via-pink-900 to-red-900 flex items-center justify-center p-4">
@@ -207,19 +368,21 @@
       }
 
       // Chat page
+      const otherUserKey = currentUser === 'regae' ? 'phish' : 'regae';
+      
       return (
         <div className="min-h-screen bg-gradient-to-br from-purple-900 via-pink-900 to-red-900 flex flex-col">
           <div className="bg-white/10 backdrop-blur-lg border-b border-white/20 p-4">
             <div className="max-w-4xl mx-auto flex items-center justify-between">
               <div>
-                <h1 className="text-2xl font-bold text-white">Hush</h1>
+                <h1 className="text-2xl font-bold text-white">Hush {isMaster ? '👑' : '👻'}</h1>
                 <p className="text-pink-200 text-sm">Logged in as {getDisplayName(currentUser)}</p>
               </div>
               <div className="flex items-center gap-3">
                 <div className="flex items-center gap-2 bg-white/10 px-3 py-2 rounded-lg">
-                  <div className={`w-2 h-2 rounded-full ${onlineUsers[currentUser === 'regae' ? 'phish' : 'regae'] ? 'bg-green-400' : 'bg-gray-400'}`}></div>
+                  <div className={`w-2 h-2 rounded-full ${onlineUsers[otherUserKey] ? 'bg-green-400' : 'bg-gray-400'}`}></div>
                   <span className="text-white text-sm">
-                    {getDisplayName(currentUser === 'regae' ? 'phish' : 'regae')} - {onlineUsers[currentUser === 'regae' ? 'phish' : 'regae'] ? 'Online' : 'Offline'}
+                    {getDisplayName(otherUserKey)} - {onlineUsers[otherUserKey] ? 'Online' : 'Offline'}
                   </span>
                 </div>
                 
@@ -231,7 +394,7 @@
                     <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
                     <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
                   </svg>
-                  Ping {getDisplayName(currentUser === 'regae' ? 'phish' : 'regae')}
+                  Ping {getDisplayName(otherUserKey)}
                 </button>
                 <button
                   onClick={logout}
@@ -243,7 +406,7 @@
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4">
+          <div id="chat-content" className="flex-1 overflow-y-auto p-4">
             <div className="max-w-4xl mx-auto space-y-3">
               {messages.length === 0 && (
                 <div className="text-center text-pink-200 mt-20">
@@ -254,7 +417,7 @@
               
               {messages.map((msg) => (
                 <div
-                  key={msg.id}
+                  key={msg.firebaseId || msg.id} 
                   className={`flex ${msg.sender === 'system' ? 'justify-center' : msg.sender === currentUser ? 'justify-end' : 'justify-start'} animate-fade-in`}
                 >
                   <div
@@ -273,6 +436,17 @@
                     )}
                     <p>{msg.text}</p>
                   </div>
+                  
+                  {/* 🗑️ Master Delete Button (Reggae Only) */}
+                  {isMaster && msg.sender !== 'system' && (
+                    <button
+                      onClick={() => deleteMessageMutual(msg.firebaseId)}
+                      className="text-white/50 hover:text-red-400 p-1 transition-all text-sm ml-2 self-start"
+                      title="Delete Permanently"
+                    >
+                      X
+                    </button>
+                  )}
                 </div>
               ))}
               <div ref={messagesEndRef} />
@@ -303,6 +477,12 @@
           </div>
 
           <style>{`
+            .secure-mask {
+              /* This makes the background of the chat content solid white, obscuring messages */
+              background-color: white !important; 
+              transition: background-color 0.1s ease;
+            }
+            
             @keyframes fade-in {
               from {
                 opacity: 0;
